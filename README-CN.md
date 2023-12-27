@@ -1,8 +1,8 @@
 # 欢迎使用 NebulaGraph Exchange-csv
 
-[中文说明](https://github.com/lkycxb/nebula-exchange-csv/blob/main/README-CN.md)
+[English](https://github.com/lkycxb/nebula-exchange-csv/blob/main/README-CN.md)
 
-官网NebulaGraph Exchange 由于开源版不支持导出功能,故特针对开源版实现了nebula-->csv-->nebula的导入导出工具,实现数据迁移.
+官网NebulaGraph Exchange 由于开源版不支持导出功能,故特针对开源版实现了nebula-->csv-->nebula的导入导出工具,来完成数据迁移.
 
 ## 使用说明
 
