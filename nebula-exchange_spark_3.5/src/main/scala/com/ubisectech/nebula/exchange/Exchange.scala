@@ -1,0 +1,381 @@
+/* Copyright (c) 2020 vesoft inc. All rights reserved.
+ *
+ * This source code is licensed under Apache 2.0 License.
+ */
+
+package com.ubisectech.nebula.exchange
+
+import com.globalmentor.apache.hadoop.fs.BareLocalFileSystem
+import com.ubisectech.nebula.exchange.common.config._
+import com.ubisectech.nebula.exchange.common.processor.ReloadProcessor
+import com.ubisectech.nebula.exchange.common.utils.SparkValidate
+import com.ubisectech.nebula.exchange.common.{Argument, CheckPointHandler, ErrorHandler}
+import com.ubisectech.nebula.exchange.processor.{EdgeProcessor, VerticesProcessor}
+import com.ubisectech.nebula.exchange.reader._
+import org.apache.spark.sql.functions.{col, concat_ws}
+import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.{Column, DataFrame, SparkSession}
+import org.apache.spark.{SparkConf, SparkEnv}
+import org.slf4j.LoggerFactory
+
+import scala.collection.mutable.ListBuffer
+
+final case class TooManyErrorsException(private val message: String) extends Exception(message)
+
+/**
+ * SparkClientGenerator is a simple spark job used to write data into Nebula Graph parallel.
+ */
+object Exchange {
+  private[this] val LOG = LoggerFactory.getLogger(this.getClass)
+
+  def main(args: Array[String]): Unit = {
+    val PROGRAM_NAME = "Nebula Graph Exchange"
+    val options = Configs.parser(args, PROGRAM_NAME)
+    val c: Argument = options match {
+      case Some(config) => config
+      case _ =>
+        LOG.error("Argument parse failed")
+        sys.exit(-1)
+    }
+
+    val configs = Configs.parse(c.config, c.variable, c.param)
+    LOG.info(s"Config ${configs}")
+    //val s= scala.Product
+
+
+    val sparkConf = new SparkConf()
+    val isWin = System.getProperty("os.name").toLowerCase().contains("win")
+    if (isWin) {
+      sparkConf.set("spark.hadoop.fs.file.impl", classOf[BareLocalFileSystem].getName)
+    }
+    val serClsArr: Array[Class[_]] = Array(classOf[com.facebook.thrift.protocol.THeaderProtocol], classOf[com.facebook.thrift.async.TAsyncClientManager])
+    sparkConf.registerKryoClasses(serClsArr)
+    for (key <- configs.sparkConfigEntry.map.keySet) {
+      sparkConf.set(key, configs.sparkConfigEntry.map(key))
+    }
+
+
+
+
+    // com.vesoft.exchange.common.config hive for sparkSession
+    if (c.hive) {
+      if (configs.hiveConfigEntry.isEmpty) {
+        LOG.info(
+          "you don't com.vesoft.exchange.common.config hive source, so using hive tied with spark.")
+      } else {
+        val hiveConfig = configs.hiveConfigEntry.get
+        sparkConf.set("spark.sql.warehouse.dir", hiveConfig.warehouse)
+        sparkConf
+          .set("javax.jdo.option.ConnectionURL", hiveConfig.connectionURL)
+          .set("javax.jdo.option.ConnectionDriverName", hiveConfig.connectionDriverName)
+          .set("javax.jdo.option.ConnectionUserName", hiveConfig.connectionUserName)
+          .set("javax.jdo.option.ConnectionPassword", hiveConfig.connectionPassWord)
+      }
+    }
+    val session = SparkSession
+      .builder()
+      .appName(PROGRAM_NAME)
+      .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+      .config(sparkConf)
+
+    if (c.hive) {
+      session.enableHiveSupport()
+    }
+
+    val spark = session.getOrCreate()
+    // check the spark version
+    SparkValidate.validate(spark.version, "3.0.*", "3.1.*", "3.2.*", "3.3.*", "3.4.*", "3.5.0")
+
+    // reload for failed import tasks
+    if (!c.reload.isEmpty) {
+      val batchSuccess = spark.sparkContext.longAccumulator(s"batchSuccess.reload")
+      val batchFailure = spark.sparkContext.longAccumulator(s"batchFailure.reload")
+
+      val data = spark.read.text(c.reload)
+      val processor = new ReloadProcessor(data, configs, batchSuccess, batchFailure)
+      processor.process()
+      LOG.info(s"batchSuccess.reload: ${batchSuccess.value}")
+      LOG.info(s"batchFailure.reload: ${batchFailure.value}")
+      sys.exit(0)
+    }
+
+    // record the failed batch number
+    var failures: Long = 0L
+
+    // import tags
+    if (configs.tagsConfig.nonEmpty) {
+      for (tagConfig <- configs.tagsConfig) {
+        LOG.info(s"Processing Tag ${tagConfig.name}")
+        spark.sparkContext.setJobGroup(tagConfig.name, s"Tag: ${tagConfig.name}")
+
+        val fieldKeys = tagConfig.fields
+        LOG.info(s"field keys: ${fieldKeys.mkString(", ")}")
+        val nebulaKeys = tagConfig.nebulaFields
+        LOG.info(s"nebula keys: ${nebulaKeys.mkString(", ")}")
+
+        val fields = tagConfig.vertexField :: tagConfig.fields
+        val data = createDataSource(spark, configs, tagConfig.dataSourceConfigEntry, fields)
+        if (data.isDefined && c.dry && !data.get.isStreaming) {
+          data.get.show(truncate = false)
+        }
+        if (data.isDefined && !c.dry) {
+          val df = if (tagConfig.vertexUdf.isDefined) {
+            dataUdf(data.get, tagConfig.vertexUdf.get)
+          } else {
+            data.get
+          }
+          val startTime = System.currentTimeMillis()
+          val batchSuccess =
+            spark.sparkContext.longAccumulator(s"batchSuccess.${tagConfig.name}")
+          val batchFailure =
+            spark.sparkContext.longAccumulator(s"batchFailure.${tagConfig.name}")
+
+          val processor = new VerticesProcessor(
+            spark,
+            repartition(df, tagConfig.partition, tagConfig.dataSourceConfigEntry.category),
+            tagConfig,
+            fieldKeys,
+            nebulaKeys,
+            configs,
+            batchSuccess,
+            batchFailure
+          )
+          processor.process()
+          val costTime = ((System.currentTimeMillis() - startTime) / 1000.0).formatted("%.2f")
+
+          if (tagConfig.dataSinkConfigEntry.category == SinkCategory.CLIENT) {
+            LOG.info(s"Import for tag ${tagConfig.name}, cost time: ${costTime}s")
+            LOG.info(s"Client-Import: batchSuccess.${tagConfig.name}: ${batchSuccess.value}")
+            LOG.info(s"Client-Import: batchFailure.${tagConfig.name}: ${batchFailure.value}")
+            failures += batchFailure.value
+          } else {
+            LOG.info(s"Export for tag ${tagConfig.name}, cost time: ${costTime}s")
+            LOG.info(s"Export: batchSuccess.${tagConfig.name}: ${batchSuccess.value}")
+            LOG.info(s"Export: batchFailure.${tagConfig.name}: ${batchFailure.value}")
+          }
+        }
+      }
+    } else {
+      LOG.warn("Tag is not defined")
+    }
+
+    // import edges
+    if (configs.edgesConfig.nonEmpty) {
+      for (edgeConfig <- configs.edgesConfig) {
+        LOG.info(s"Processing Edge ${edgeConfig.name}")
+        spark.sparkContext.setJobGroup(edgeConfig.name, s"Edge: ${edgeConfig.name}")
+
+        val fieldKeys = edgeConfig.fields
+        LOG.info(s"field keys: ${fieldKeys.mkString(", ")}")
+        val nebulaKeys = edgeConfig.nebulaFields
+        LOG.info(s"nebula keys: ${nebulaKeys.mkString(", ")}")
+        val fields = if (edgeConfig.rankingField.isDefined) {
+          edgeConfig.rankingField.get :: edgeConfig.sourceField :: edgeConfig.targetField :: edgeConfig.fields
+        } else {
+          edgeConfig.sourceField :: edgeConfig.targetField :: edgeConfig.fields
+        }
+        val data = createDataSource(spark, configs, edgeConfig.dataSourceConfigEntry, fields)
+        if (data.isDefined && c.dry && !data.get.isStreaming) {
+          data.get.show(truncate = false)
+        }
+        if (data.isDefined && !c.dry) {
+          var df = data.get
+          if (edgeConfig.srcVertexUdf.isDefined) {
+            df = dataUdf(df, edgeConfig.srcVertexUdf.get)
+          }
+          if (edgeConfig.dstVertexUdf.isDefined) {
+            df = dataUdf(df, edgeConfig.dstVertexUdf.get)
+          }
+
+          val startTime = System.currentTimeMillis()
+          val batchSuccess = spark.sparkContext.longAccumulator(s"batchSuccess.${edgeConfig.name}")
+          val batchFailure = spark.sparkContext.longAccumulator(s"batchFailure.${edgeConfig.name}")
+
+          val processor = new EdgeProcessor(
+            spark,
+            repartition(df, edgeConfig.partition, edgeConfig.dataSourceConfigEntry.category),
+            edgeConfig,
+            fieldKeys,
+            nebulaKeys,
+            configs,
+            batchSuccess,
+            batchFailure
+          )
+          processor.process()
+          val costTime = ((System.currentTimeMillis() - startTime) / 1000.0).formatted("%.2f")
+
+          if (edgeConfig.dataSinkConfigEntry.category == SinkCategory.CLIENT) {
+            LOG.info(s"Import for edge ${edgeConfig.name}, cost time: ${costTime}s")
+            LOG.info(s"Client-Import: batchSuccess.${edgeConfig.name}: ${batchSuccess.value}")
+            LOG.info(s"Client-Import: batchFailure.${edgeConfig.name}: ${batchFailure.value}")
+            failures += batchFailure.value
+          } else {
+            LOG.info(s"Export for edge ${edgeConfig.name}, cost time: ${costTime}s")
+            LOG.info(s"Export: batchSuccess.${edgeConfig.name}: ${batchSuccess.value}")
+            LOG.info(s"Export: batchFailure.${edgeConfig.name}: ${batchFailure.value}")
+          }
+        }
+      }
+    } else {
+      LOG.warn("Edge is not defined")
+    }
+
+    // reimport for failed tags and edges
+    val errorPath = s"${configs.errorConfig.errorPath}/${SparkEnv.get.blockManager.conf.getAppId}"
+    if (failures > 0 && ErrorHandler.existError(errorPath)) {
+      spark.sparkContext.setJobGroup("Reload", s"Reload: ${errorPath}")
+      val batchSuccess = spark.sparkContext.longAccumulator(s"batchSuccess.reimport")
+      val batchFailure = spark.sparkContext.longAccumulator(s"batchFailure.reimport")
+      val data = spark.read.text(errorPath)
+      val startTime = System.currentTimeMillis()
+      val processor = new ReloadProcessor(data, configs, batchSuccess, batchFailure)
+      processor.process()
+      val costTime = ((System.currentTimeMillis() - startTime) / 1000.0).formatted("%.2f")
+      LOG.info(s"reimport ngql cost time: ${costTime}")
+      LOG.info(s"batchSuccess.reimport: ${batchSuccess.value}")
+      LOG.info(s"batchFailure.reimport: ${batchFailure.value}")
+    }
+    spark.close()
+  }
+
+  /**
+   * Create data source for different data type.
+   *
+   * @param session The Spark Session.
+   * @param config  The com.vesoft.exchange.common.config.
+   * @return
+   */
+  private[this] def createDataSource(
+                                      session: SparkSession,
+                                      configs: Configs,
+                                      config: DataSourceConfigEntry,
+                                      fields: List[String]
+                                    ): Option[DataFrame] = {
+    config.category match {
+      case SourceCategory.NEBULA =>
+        val nebulaConfig = config.asInstanceOf[NebulaSourceConfigEntry]
+        LOG.info(s"""Loading Nebula from ${nebulaConfig.graphHosts},tagName:${nebulaConfig.sentence}""")
+        //不能匹分是tag还是edge,所以通过获取元数据来区分
+        val reader = new NebulaReader(session, configs, nebulaConfig)
+        Some(reader.read())
+      case SourceCategory.SST =>
+        val sstConfig = config.asInstanceOf[FileBaseSourceConfigEntry]
+        LOG.info(s"""Loading Sst files from ${sstConfig.path}""")
+        //不能匹分是tag还是edge,所以通过获取元数据来区分
+        val reader = new SstReader(session, sstConfig)
+        Some(reader.read())
+      case SourceCategory.PARQUET =>
+        val parquetConfig = config.asInstanceOf[FileBaseSourceConfigEntry]
+        LOG.info(s"""Loading Parquet files from ${parquetConfig.path}""")
+        val reader = new ParquetReader(session, parquetConfig)
+        Some(reader.read())
+      case SourceCategory.ORC =>
+        val orcConfig = config.asInstanceOf[FileBaseSourceConfigEntry]
+        LOG.info(s"""Loading ORC files from ${orcConfig.path}""")
+        val reader = new ORCReader(session, orcConfig)
+        Some(reader.read())
+      case SourceCategory.JSON =>
+        val jsonConfig = config.asInstanceOf[FileBaseSourceConfigEntry]
+        LOG.info(s"""Loading JSON files from ${jsonConfig.path}""")
+        val reader = new JSONReader(session, jsonConfig)
+        Some(reader.read())
+      case SourceCategory.CSV =>
+        val csvConfig = config.asInstanceOf[FileBaseSourceConfigEntry]
+        LOG.info(s"""Loading CSV files from ${csvConfig.path}""")
+        val reader = new CSVReader(session, csvConfig)
+        Some(reader.read())
+      case SourceCategory.HIVE =>
+        val hiveConfig = config.asInstanceOf[HiveSourceConfigEntry]
+        LOG.info(s"""Loading from Hive and exec ${hiveConfig.sentence}""")
+        val reader = new HiveReader(session, hiveConfig)
+        Some(reader.read())
+      case SourceCategory.KAFKA => {
+        val kafkaConfig = config.asInstanceOf[KafkaSourceConfigEntry]
+        LOG.info(s"""Loading from Kafka ${kafkaConfig.server} and subscribe ${kafkaConfig.topic}""")
+        val reader = new KafkaReader(session, kafkaConfig, fields)
+        Some(reader.read())
+      }
+      case SourceCategory.NEO4J =>
+        val neo4jConfig = config.asInstanceOf[Neo4JSourceConfigEntry]
+        LOG.info(s"Loading from neo4j com.vesoft.exchange.common.config: ${neo4jConfig}")
+        val reader = new Neo4JReader(session, neo4jConfig)
+        Some(reader.read())
+      case SourceCategory.MYSQL =>
+        val mysqlConfig = config.asInstanceOf[MySQLSourceConfigEntry]
+        LOG.info(s"Loading from mysql com.vesoft.exchange.common.config: ${mysqlConfig}")
+        val reader = new MySQLReader(session, mysqlConfig)
+        Some(reader.read())
+      case SourceCategory.POSTGRESQL =>
+        val postgreConfig = config.asInstanceOf[PostgreSQLSourceConfigEntry]
+        LOG.info(s"Loading from postgre com.vesoft.exchange.common.config: ${postgreConfig}")
+        val reader = new PostgreSQLReader(session, postgreConfig)
+        Some(reader.read())
+      case SourceCategory.PULSAR =>
+        val pulsarConfig = config.asInstanceOf[PulsarSourceConfigEntry]
+        LOG.info(s"Loading from pulsar com.vesoft.exchange.common.config: ${pulsarConfig}")
+        val reader = new PulsarReader(session, pulsarConfig)
+        Some(reader.read())
+      case SourceCategory.JANUS_GRAPH =>
+        val janusGraphSourceConfigEntry = config.asInstanceOf[JanusGraphSourceConfigEntry]
+        val reader = new JanusGraphReader(session, janusGraphSourceConfigEntry)
+        Some(reader.read())
+      case SourceCategory.HBASE =>
+        val hbaseSourceConfigEntry = config.asInstanceOf[HBaseSourceConfigEntry]
+        val reader = new HBaseReader(session, hbaseSourceConfigEntry)
+        Some(reader.read())
+      case SourceCategory.MAXCOMPUTE =>
+        val maxComputeConfigEntry = config.asInstanceOf[MaxComputeConfigEntry]
+        val reader = new MaxcomputeReader(session, maxComputeConfigEntry)
+        Some(reader.read())
+      case SourceCategory.CLICKHOUSE => {
+        val clickhouseConfigEntry = config.asInstanceOf[ClickHouseConfigEntry]
+        val reader = new ClickhouseReader(session, clickhouseConfigEntry)
+        Some(reader.read())
+      }
+      case SourceCategory.ORACLE => {
+        val oracleConfig = config.asInstanceOf[OracleConfigEntry]
+        val reader = new OracleReader(session, oracleConfig)
+        Some(reader.read())
+      }
+      case SourceCategory.JDBC => {
+        val jdbcConfig = config.asInstanceOf[JdbcConfigEntry]
+        val reader = new JdbcReader(session, jdbcConfig)
+        Some(reader.read())
+      }
+      case _ => {
+        LOG.error(s"Data source ${config.category} not supported")
+        None
+      }
+    }
+  }
+
+  /**
+   * Repartition the data frame using the specified partition number.
+   *
+   * @param frame
+   * @param partition
+   * @return
+   */
+  private[this] def repartition(frame: DataFrame,
+                                partition: Int,
+                                sourceCategory: SourceCategory.Value): DataFrame = {
+    if (partition > 0 && !CheckPointHandler.checkSupportResume(sourceCategory)) {
+      frame.repartition(partition).toDF
+    } else {
+      frame
+    }
+  }
+
+  private[this] def dataUdf(data: DataFrame, udfConfig: UdfConfigEntry): DataFrame = {
+    val oldCols = udfConfig.oldColNames
+    val sep = udfConfig.sep
+    val newCol = udfConfig.newColName
+    val originalFieldsNames = data.schema.fieldNames.toList
+    val finalColNames: ListBuffer[Column] = new ListBuffer[Column]
+    for (field <- originalFieldsNames) {
+      finalColNames.append(col(field))
+    }
+    finalColNames.append(concat_ws(sep, oldCols.map(c => col(c)): _*).cast(StringType).as(newCol))
+    data.select(finalColNames: _*)
+  }
+}
