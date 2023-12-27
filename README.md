@@ -8,11 +8,11 @@ Due to the fact that the open source version does not support export functionali
 
 ## usage
 
-###1. 本项目基于NebulaGraph-3.6.1+Spark3.5.0实现.
-###2. 依赖相关项目:spark-nebula-connector
-###3. 配置文件
+###1. based on NebulaGraph-3.6.1+Spark3.5.0实现.
+###2. dependencys:spark-nebula-connector
+###3. config file
     refrence:nebula-exchange_spark_3.5/src/test/resources/config
-###4. 使用方法
+###4. run
     refrence: nebula-exchange_spark_3.5/src/test/com.ubisectech.nebula.exchange.TestExchange classes.
 
 
